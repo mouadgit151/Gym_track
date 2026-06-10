@@ -26,9 +26,66 @@ const html = htm.bind(h);
 // ─── Supabase ──────────────────────────────────────────────────────────────────
 const SB_URL="https://ukwyevmupdyookxyqven.supabase.co";
 const SB_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVrd3lldm11cGR5b29reHlxdmVuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg5ODAzMzAsImV4cCI6MjA5NDU1NjMzMH0.ntcvdQsWQue4GdFn26KTtv0Vn60R7_F58Vw0ya6I5NI";
+
+// Auth token stored in memory (refreshed from localStorage on load)
+let authToken = localStorage.getItem("sb_access_token") || SB_KEY;
+let currentUserId = localStorage.getItem("sb_user_id") || null;
+
 async function sbFetch(path,opts={}){
-  const res=await fetch(SB_URL+"/rest/v1/"+path,{...opts,headers:{"apikey":SB_KEY,"Authorization":"Bearer "+SB_KEY,"Content-Type":"application/json","Prefer":opts.prefer||"return=representation",...(opts.headers||{})}});
+  const res=await fetch(SB_URL+"/rest/v1/"+path,{...opts,headers:{"apikey":SB_KEY,"Authorization":"Bearer "+authToken,"Content-Type":"application/json","Prefer":opts.prefer||"return=representation",...(opts.headers||{})}});
   const t=await res.text();return t?JSON.parse(t):[];
+}
+
+async function sbLogin(email, password){
+  const res=await fetch(SB_URL+"/auth/v1/token?grant_type=password",{
+    method:"POST",
+    headers:{"apikey":SB_KEY,"Content-Type":"application/json"},
+    body:JSON.stringify({email,password}),
+  });
+  const data=await res.json();
+  if(data.access_token){
+    authToken=data.access_token;
+    currentUserId=data.user?.id||null;
+    localStorage.setItem("sb_access_token",data.access_token);
+    localStorage.setItem("sb_user_id",currentUserId||"");
+    // Store refresh token too
+    if(data.refresh_token) localStorage.setItem("sb_refresh_token",data.refresh_token);
+    return{ok:true,user:data.user};
+  }
+  return{ok:false,error:data.error_description||data.msg||"Erreur de connexion"};
+}
+
+async function sbLogout(){
+  try{
+    await fetch(SB_URL+"/auth/v1/logout",{method:"POST",headers:{"apikey":SB_KEY,"Authorization":"Bearer "+authToken}});
+  }catch{}
+  authToken=SB_KEY;
+  currentUserId=null;
+  localStorage.removeItem("sb_access_token");
+  localStorage.removeItem("sb_user_id");
+  localStorage.removeItem("sb_refresh_token");
+}
+
+async function sbRefreshSession(){
+  const refresh=localStorage.getItem("sb_refresh_token");
+  if(!refresh) return false;
+  try{
+    const res=await fetch(SB_URL+"/auth/v1/token?grant_type=refresh_token",{
+      method:"POST",
+      headers:{"apikey":SB_KEY,"Content-Type":"application/json"},
+      body:JSON.stringify({refresh_token:refresh}),
+    });
+    const data=await res.json();
+    if(data.access_token){
+      authToken=data.access_token;
+      currentUserId=data.user?.id||null;
+      localStorage.setItem("sb_access_token",data.access_token);
+      localStorage.setItem("sb_user_id",currentUserId||"");
+      if(data.refresh_token) localStorage.setItem("sb_refresh_token",data.refresh_token);
+      return true;
+    }
+  }catch{}
+  return false;
 }
 
 // ─── Timezone Montréal ─────────────────────────────────────────────────────────
@@ -696,56 +753,186 @@ function History({workouts,unit}){
 const TABS=[{id:"dashboard",label:"Dashboard"},{id:"log",label:"Log séance"},{id:"programs",label:"Programmes"},{id:"progress",label:"Progression"},{id:"history",label:"Historique"}];
 
 async function fetchWorkouts(){
-  try{const rows=await sbFetch("daily_logs?select=date,data&order=date.desc&limit=300");return rows.map(r=>r.data?importLog(r.data,r.date):null).filter(Boolean);}
-  catch(e){console.error("Supabase fetch:",e);return[];}
-}
-async function saveWorkout(workout){
+  if(!currentUserId) return [];
   try{
-    const ex=await sbFetch(`daily_logs?date=eq.${workout.date}&select=*`);
+    const rows=await sbFetch(`daily_logs?user_id=eq.${currentUserId}&select=date,data&order=date.desc&limit=300`);
+    return rows.map(r=>r.data?importLog(r.data,r.date):null).filter(Boolean);
+  }catch(e){console.error("Supabase fetch:",e);return[];}
+}
+
+async function saveWorkout(workout){
+  if(!currentUserId) return;
+  try{
+    const ex=await sbFetch(`daily_logs?user_id=eq.${currentUserId}&date=eq.${workout.date}&select=*`);
     const exercises=workout.exercises.map(ex=>({id:Date.now()+Math.random(),name:ex.name,muscle:ex.muscle,unit:"lbs",sets:ex.sets.map(s=>({reps:String(s.r),weight:String(Math.round(dispW(s.w,"lb")*10)/10)})),isCustom:false}));
-    if(ex&&ex[0]){const nd={...ex[0].data,exercises:[...(ex[0].data.exercises||[]),...exercises]};await sbFetch(`daily_logs?id=eq.${ex[0].id}`,{method:"PATCH",body:JSON.stringify({data:nd}),prefer:"return=minimal"});}
+    if(ex&&ex[0]){
+      const nd={...ex[0].data,exercises:[...(ex[0].data.exercises||[]),...exercises]};
+      await sbFetch(`daily_logs?id=eq.${ex[0].id}`,{method:"PATCH",body:JSON.stringify({data:nd}),prefer:"return=minimal"});
+    } else {
+      await sbFetch(`daily_logs`,{method:"POST",body:JSON.stringify({user_id:currentUserId,date:workout.date,data:{isSportDay:true,exercises}}),prefer:"return=minimal"});
+    }
   }catch(e){console.error("Supabase save:",e);}
 }
 
+// ─── Login Screen ──────────────────────────────────────────────────────────────
+function LoginScreen({onLogin}){
+  const[email,setEmail]=useState("");
+  const[pw,setPw]=useState("");
+  const[err,setErr]=useState("");
+  const[loading,setLoading]=useState(false);
+
+  const handle=async()=>{
+    if(!email||!pw) return;
+    setLoading(true);setErr("");
+    const res=await sbLogin(email,pw);
+    if(res.ok) onLogin(res.user);
+    else setErr(res.error);
+    setLoading(false);
+  };
+
+  return html`<div style=${{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 24px"}}>
+    <div style=${{width:"100%",maxWidth:380}}>
+      <div style=${{textAlign:"center",marginBottom:40}}>
+        <div style=${{fontSize:52,marginBottom:12}}>💪</div>
+        <h1 style=${{fontSize:28,fontWeight:800,color:C.ac,fontFamily:"'DM Mono',monospace",marginBottom:8}}>GymTracker</h1>
+        <p style=${{fontSize:13,color:C.mu}}>Connecte-toi avec ton compte My Fit Lab</p>
+      </div>
+      <div style=${{background:C.s1,border:`1px solid ${C.b1}`,borderRadius:16,padding:24}}>
+        <div style=${{marginBottom:14}}>
+          <div style=${{fontSize:11,color:C.mu,marginBottom:6,textTransform:"uppercase",letterSpacing:"0.06em"}}>Email</div>
+          <input type="email" value=${email} onInput=${e=>setEmail(e.target.value)}
+            onKeyDown=${e=>e.key==="Enter"&&handle()}
+            placeholder="ton@email.com"
+            style=${{...inp,fontSize:15}}/>
+        </div>
+        <div style=${{marginBottom:20}}>
+          <div style=${{fontSize:11,color:C.mu,marginBottom:6,textTransform:"uppercase",letterSpacing:"0.06em"}}>Mot de passe</div>
+          <input type="password" value=${pw} onInput=${e=>setPw(e.target.value)}
+            onKeyDown=${e=>e.key==="Enter"&&handle()}
+            placeholder="••••••••"
+            style=${{...inp,fontSize:15}}/>
+        </div>
+        ${err&&html`<div style=${{background:"#ff444418",border:`1px solid ${C.rd}`,borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:13,color:C.rd}}>${err}</div>`}
+        <button onClick=${handle} disabled=${loading}
+          style=${{...btnP,width:"100%",padding:"12px",fontSize:15,opacity:loading?0.6:1}}>
+          ${loading?"Connexion…":"Se connecter →"}
+        </button>
+      </div>
+      <div style=${{textAlign:"center",marginTop:16,fontSize:12,color:C.mu}}>
+        Même compte que My Fit Lab
+      </div>
+    </div>
+  </div>`;
+}
+
+// ─── App ───────────────────────────────────────────────────────────────────────
 function App(){
+  const[user,setUser]=useState(null);
+  const[checkingAuth,setCheckingAuth]=useState(true);
   const[tab,setTab]=useState("dashboard");
   const[workouts,setWorkouts]=useState(SAMPLES);
   const[programs,setPrograms]=useState(DEFAULT_PROGRAMS);
   const[unit,setUnit]=useState("lb");
   const[toast,setToast]=useState(null);
-  const[loading,setLoading]=useState(true);
-  const[sync,setSync]=useState("loading");
+  const[loading,setLoading]=useState(false);
+  const[sync,setSync]=useState("idle");
 
+  // On mount: check if we have a saved session
   useEffect(()=>{
+    async function checkSession(){
+      const savedToken=localStorage.getItem("sb_access_token");
+      const savedUid=localStorage.getItem("sb_user_id");
+      if(savedToken&&savedUid){
+        // Try to use existing token
+        authToken=savedToken;
+        currentUserId=savedUid;
+        // Verify it's still valid by fetching user
+        try{
+          const res=await fetch(SB_URL+"/auth/v1/user",{headers:{"apikey":SB_KEY,"Authorization":"Bearer "+savedToken}});
+          if(res.ok){
+            const u=await res.json();
+            if(u?.id){setUser(u);setCheckingAuth(false);return;}
+          }
+        }catch{}
+        // Token expired — try refresh
+        const refreshed=await sbRefreshSession();
+        if(refreshed){
+          try{
+            const res=await fetch(SB_URL+"/auth/v1/user",{headers:{"apikey":SB_KEY,"Authorization":"Bearer "+authToken}});
+            if(res.ok){const u=await res.json();if(u?.id){setUser(u);setCheckingAuth(false);return;}}
+          }catch{}
+        }
+        // All failed — clear and show login
+        await sbLogout();
+      }
+      setCheckingAuth(false);
+    }
+    checkSession();
+  },[]);
+
+  // Load data when user is set
+  useEffect(()=>{
+    if(!user) return;
+    setLoading(true);setSync("loading");
     fetchWorkouts().then(imported=>{
       if(imported.length>0){
         setWorkouts(prev=>{const sd=new Set(imported.map(w=>w.date));return[...prev.filter(w=>!w.id.startsWith("imp_")&&!sd.has(w.date)),...imported].sort((a,b)=>a.date.localeCompare(b.date));});
         setSync("ok");
-      }else setSync("err");
+      } else {
+        setSync("err");
+      }
       setLoading(false);
     });
-  },[]);
+  },[user]);
 
   const showToast=msg=>{setToast(msg);setTimeout(()=>setToast(null),3000);};
-  const handleSave=async wo=>{setWorkouts(prev=>[...prev,wo].sort((a,b)=>a.date.localeCompare(b.date)));showToast("Séance sauvegardée 💪");setTab("dashboard");saveWorkout(wo);};
-  const SB={loading:{label:"⟳ Sync…",color:C.bl},ok:{label:"✓ Supabase",color:C.ac},err:{label:"⚠ Local",color:C.or}};
+  const handleSave=async wo=>{
+    setWorkouts(prev=>[...prev,wo].sort((a,b)=>a.date.localeCompare(b.date)));
+    showToast("Séance sauvegardée 💪");
+    setTab("dashboard");
+    saveWorkout(wo);
+  };
+  const handleLogout=async()=>{
+    await sbLogout();
+    setUser(null);
+    setWorkouts(SAMPLES);
+    setSync("idle");
+  };
+  const handleLogin=u=>{setUser(u);};
 
+  const SB={idle:{label:"",color:C.mu},loading:{label:"⟳ Sync…",color:C.bl},ok:{label:"✓ Supabase",color:C.ac},err:{label:"⚠ Local",color:C.or}};
+
+  // Still checking session
+  if(checkingAuth) return html`<div style=${{minHeight:"100vh",background:C.bg,display:"flex",alignItems:"center",justifyContent:"center"}}>
+    <div style=${{textAlign:"center",color:C.mu}}>
+      <div style=${{fontSize:32,animation:"spin 1s linear infinite",display:"inline-block",marginBottom:12}}>⟳</div>
+      <div style=${{fontSize:13}}>Vérification de la session…</div>
+    </div>
+  </div>`;
+
+  // Not logged in
+  if(!user) return html`<${LoginScreen} onLogin=${handleLogin}/>`;
+
+  // Logged in
   return html`<div style=${{background:C.bg,minHeight:"100vh",color:C.tx,fontFamily:"'DM Sans',sans-serif"}}>
     <div style=${{borderBottom:`1px solid ${C.b1}`,padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",background:C.s1,position:"sticky",top:0,zIndex:100}}>
       <div style=${{display:"flex",alignItems:"center",gap:10}}>
         <div style=${{width:28,height:28,background:C.ac,borderRadius:6,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>💪</div>
         <span style=${{fontWeight:700,fontSize:15}}>GymTracker</span>
         <span style=${{fontSize:11,color:C.mu,background:C.s2,padding:"2px 8px",borderRadius:4}}>BETA</span>
-        <span style=${{fontSize:11,color:SB[sync].color,background:SB[sync].color+"18",padding:"2px 8px",borderRadius:4}}>${SB[sync].label}</span>
+        ${SB[sync].label&&html`<span style=${{fontSize:11,color:SB[sync].color,background:SB[sync].color+"18",padding:"2px 8px",borderRadius:4}}>${SB[sync].label}</span>`}
       </div>
-      <span style=${{fontSize:12,color:C.mu,fontFamily:"'DM Mono',monospace"}}>${new Intl.DateTimeFormat("fr-CA",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date())}</span>
+      <div style=${{display:"flex",alignItems:"center",gap:10}}>
+        <span style=${{fontSize:12,color:C.mu,fontFamily:"'DM Mono',monospace"}}>${new Intl.DateTimeFormat("fr-CA",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date())}</span>
+        <button onClick=${handleLogout} style=${{...btnG,padding:"5px 12px",fontSize:12,color:C.rd,borderColor:C.rd}}>Déco</button>
+      </div>
     </div>
     <div style=${{display:"flex",borderBottom:`1px solid ${C.b1}`,background:C.s1,overflowX:"auto"}}>
       ${TABS.map(t=>html`<button key=${t.id} onClick=${()=>setTab(t.id)} style=${{background:"none",border:"none",cursor:"pointer",padding:"12px 18px",fontSize:13,fontWeight:tab===t.id?600:400,color:tab===t.id?C.ac:C.mu,borderBottom:tab===t.id?`2px solid ${C.ac}`:"2px solid transparent",whiteSpace:"nowrap",transition:"all 0.15s"}}>${t.label}</button>`)}
     </div>
     ${loading?html`<div style=${{padding:"60px 24px",textAlign:"center",color:C.mu,fontSize:13}}>
       <div style=${{fontSize:28,marginBottom:12,display:"inline-block",animation:"spin 1s linear infinite"}}>⟳</div>
-      <div>Chargement depuis Supabase…</div>
+      <div>Chargement de tes données…</div>
     </div>`:html`<div style=${{padding:"20px 24px",maxWidth:1100,margin:"0 auto"}}>
       ${tab==="dashboard"&&html`<${Dashboard} workouts=${workouts} unit=${unit} setUnit=${setUnit}/>`}
       ${tab==="log"&&html`<${LogWorkout} onSave=${handleSave} workouts=${workouts} programs=${programs} unit=${unit} setUnit=${setUnit}/>`}
